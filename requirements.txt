@@ -6,16 +6,21 @@ pydantic-settings
 pyyaml
 scikit-learn
 httpx
-sentence-transformers
 sqlalchemy
 psycopg[binary]
+psycopg2-binary
+
+# ML - CPU only
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
+sentence-transformers
 
 # Testing
 pytest
 
-# Optional — install only when using real cloud providers:
-#   pip install openai        # for OpenAI provider
-#   pip install anthropic     # for Anthropic provider
+# Optional cloud providers
+# openai
+# anthropic
 
-# Optional — install only when enabling HF toxicity or NER models:
-#   pip install transformers torch
+# Optional HF models
+# transformers
