@@ -1,0 +1,33 @@
+version: "1.0"
+extends: "base_policy.yaml"
+metadata:
+  name: "enterprise-child"
+  description: "Child enterprise LLM guardrail policy that extends base policy"
+rules:
+  - id: "toxicity-input"
+    scope: "input"
+    check:
+      type: "toxicity"
+      threshold: 0.7
+    action:
+      type: "block"
+
+  - id: "toxicity-output"
+    scope: "output"
+    check:
+      type: "toxicity"
+      threshold: 0.7
+    action:
+      type: "block"
+
+  - id: "denied-topics"
+    scope: "input"
+    check:
+      type: "topic"
+      topics:
+        - "explosives"
+        - "credential theft"
+        - "malware"
+        - "hacking"
+    action:
+      type: "block"

@@ -1,0 +1,165 @@
+import os
+from pathlib import Path
+
+from pydantic import Field, AliasChoices
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Computed once at import time from the real filesystem location of this file.
+# All default paths are relative to the project root so the project is portable.
+_BASE_DIR: Path = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    POLICY_PATH: str = Field(
+        default_factory=lambda: str(_BASE_DIR / "policy" / "policy.yaml"),
+        validation_alias=AliasChoices(
+            "GUARDLAYER_POLICY_PATH",
+            "policy_path",
+            "POLICY_PATH",
+        ),
+    )
+
+    DATABASE_URL: str = Field(
+    "postgresql+psycopg://guardlayer:guardlayer@localhost:5432/guardlayer",
+    validation_alias=AliasChoices(
+        "GUARDLAYER_DATABASE_URL",
+        "database_url",
+        "DATABASE_URL",
+    ),
+)
+
+    OLLAMA_BASE_URL: str = Field(
+        "http://localhost:11434",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_OLLAMA_BASE_URL",
+            "ollama_base_url",
+            "OLLAMA_BASE_URL",
+        ),
+    )
+
+    OLLAMA_MODEL: str = Field(
+        "llama3.2:3b",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_OLLAMA_MODEL",
+            "ollama_model",
+            "OLLAMA_MODEL",
+        ),
+    )
+
+    PROVIDER_TIMEOUT: int = Field(
+        60,
+        validation_alias=AliasChoices(
+            "GUARDLAYER_PROVIDER_TIMEOUT",
+            "provider_timeout",
+            "PROVIDER_TIMEOUT",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Real provider credentials — empty by default; validated at call time
+    # ------------------------------------------------------------------
+
+    OPENAI_API_KEY: str = Field(
+        "",
+        validation_alias=AliasChoices(
+            "OPENAI_API_KEY",
+            "guardlayer_openai_api_key",
+            "openai_api_key",
+        ),
+    )
+
+    OPENAI_MODEL: str = Field(
+        "gpt-4o-mini",
+        validation_alias=AliasChoices(
+            "OPENAI_MODEL",
+            "guardlayer_openai_model",
+            "openai_model",
+        ),
+    )
+
+    ANTHROPIC_API_KEY: str = Field(
+        "",
+        validation_alias=AliasChoices(
+            "ANTHROPIC_API_KEY",
+            "guardlayer_anthropic_api_key",
+            "anthropic_api_key",
+        ),
+    )
+
+    ANTHROPIC_MODEL: str = Field(
+        "claude-3-5-haiku-20241022",
+        validation_alias=AliasChoices(
+            "ANTHROPIC_MODEL",
+            "guardlayer_anthropic_model",
+            "anthropic_model",
+        ),
+    )
+
+    LOG_LEVEL: str = Field(
+        "INFO",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_LOG_LEVEL",
+            "log_level",
+            "LOG_LEVEL",
+        ),
+    )
+
+    EMBEDDING_MODEL_NAME: str = Field(
+        "all-MiniLM-L6-v2",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_EMBEDDING_MODEL_NAME",
+            "embedding_model_name",
+            "EMBEDDING_MODEL_NAME",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Toxicity detection — HF model disabled by default (no download needed)
+    # Set USE_HF_TOXICITY=True + install transformers/torch for real inference
+    # ------------------------------------------------------------------
+
+    TOXICITY_MODEL_NAME: str = Field(
+        "Hate-speech-CNERG/dehatebert-mono-english",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_TOXICITY_MODEL_NAME",
+            "toxicity_model_name",
+            "TOXICITY_MODEL_NAME",
+        ),
+    )
+
+    USE_HF_TOXICITY: bool = Field(
+        True,
+        validation_alias=AliasChoices(
+            "GUARDLAYER_USE_HF_TOXICITY",
+            "use_hf_toxicity",
+            "USE_HF_TOXICITY",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # PII NER — HF model disabled by default (no download needed)
+    # Set USE_HF_PII_NER=True + install transformers/torch for real NER
+    # ------------------------------------------------------------------
+
+    PII_NER_MODEL_NAME: str = Field(
+        "dslim/distilbert-NER",
+        validation_alias=AliasChoices(
+            "GUARDLAYER_PII_NER_MODEL_NAME",
+            "pii_ner_model_name",
+            "PII_NER_MODEL_NAME",
+        ),
+    )
+
+    USE_HF_PII_NER: bool = Field(
+        True,
+        validation_alias=AliasChoices(
+            "GUARDLAYER_USE_HF_PII_NER",
+            "use_hf_pii_ner",
+            "USE_HF_PII_NER",
+        ),
+    )
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+
+settings = Settings()

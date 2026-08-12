@@ -1,0 +1,21 @@
+# Core dependencies
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+pyyaml
+scikit-learn
+httpx
+sentence-transformers
+sqlalchemy
+psycopg[binary]
+
+# Testing
+pytest
+
+# Optional — install only when using real cloud providers:
+#   pip install openai        # for OpenAI provider
+#   pip install anthropic     # for Anthropic provider
+
+# Optional — install only when enabling HF toxicity or NER models:
+#   pip install transformers torch

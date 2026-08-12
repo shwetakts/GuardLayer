@@ -1,0 +1,54 @@
+version: "1.0"
+metadata:
+  name: "enterprise-base"
+  description: "Base enterprise LLM guardrail policy"
+rules:
+  - id: "pii-input"
+    scope: "input"
+    check:
+      type: "pii"
+      entities:
+        - email
+        - phone
+        - credit_card
+    action:
+      type: "block"
+
+  - id: "pii-output"
+    scope: "output"
+    check:
+      type: "pii"
+      entities:
+        - email
+        - phone
+        - credit_card
+    action:
+      type: "redact"
+      replacement: "[REDACTED]"
+
+  - id: "toxicity-input"
+    scope: "input"
+    check:
+      type: "toxicity"
+      threshold: 0.8
+    action:
+      type: "block"
+
+  - id: "toxicity-output"
+    scope: "output"
+    check:
+      type: "toxicity"
+      threshold: 0.8
+    action:
+      type: "block"
+
+  - id: "denied-topics"
+    scope: "input"
+    check:
+      type: "topic"
+      topics:
+        - "explosives"
+        - "credential theft"
+        - "malware"
+    action:
+      type: "block"

@@ -1,0 +1,194 @@
+import datetime
+import json
+import uuid
+from typing import Dict, List, Any, Optional
+
+
+from storage.base import AuditRepository
+from storage.postgres_repository import PostgresAuditRepository
+from storage.sqlite_repository import SQLiteAuditRepository
+
+
+class AuditLogger:
+    """
+    Persists sanitized audit records through the configured repository.
+
+    Production uses PostgreSQL by default.
+
+    When GUARDLAYER_DB_PATH is configured, SQLite is used instead.
+    This allows integration tests to use an isolated local database
+    without requiring a PostgreSQL server.
+    """
+
+    def __init__(
+        self,
+        repository: Optional[AuditRepository] = None,
+        db_path: Optional[str] = None,
+    ):
+        if repository is not None:
+            self.repository = repository
+            return
+
+        from app.config import settings
+
+        # Integration-test/local-development override.
+        #
+        # The test suite sets:
+        #
+        #   GUARDLAYER_DB_PATH=C:\GuardLayer\data\test_integration_audit.db
+        #
+        # When this is present, write audits to that exact SQLite file.
+        path_to_use = db_path or settings.DB_PATH
+        if path_to_use:
+            self.repository = SQLiteAuditRepository(
+                path_to_use
+            )
+        else:
+            # Production/default behavior remains PostgreSQL.
+            self.repository = PostgresAuditRepository(
+                settings.DATABASE_URL
+            )
+
+    def log(
+        self,
+        provider: str,
+        policy_version: str,
+        input_check_result: Dict[str, Any],
+        output_check_result: Optional[Dict[str, Any]],
+        final_action: str,
+        latency_ms: float,
+        called_provider: bool,
+        input_text: str,
+        output_text: Optional[str] = None,
+        session_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        audit_id: Optional[str] = None,
+    ) -> str:
+        """
+        Persist a sanitized audit log.
+
+        Raw PII is redacted from input/output text before persistence.
+        """
+
+        a_id = (
+            audit_id
+            if audit_id
+            else str(uuid.uuid4())
+        )
+
+        r_id = (
+            request_id
+            if request_id
+            else str(uuid.uuid4())
+        )
+
+        timestamp = (
+            datetime.datetime.now(datetime.UTC)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        # Redact raw input/output before writing to the database.
+        from core.checks.pii_detector import PIIDetector
+
+        redacted_input, _ = PIIDetector.redact(
+            input_text
+        )
+
+        redacted_output = None
+
+        if output_text is not None:
+            redacted_output, _ = PIIDetector.redact(
+                output_text
+            )
+
+        # Serialize guardrail results.
+        input_check_json = json.dumps(
+            input_check_result
+        )
+
+        output_check_json = (
+            json.dumps(output_check_result)
+            if output_check_result is not None
+            else None
+        )
+
+        self.repository.save(
+            audit_id=a_id,
+            timestamp=timestamp,
+            provider=provider,
+            request_id=r_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            policy_version=policy_version,
+            input_check_result=input_check_json,
+            output_check_result=output_check_json,
+            final_action=final_action,
+            latency_ms=latency_ms,
+            called_provider=1 if called_provider else 0,
+            input_text=redacted_input,
+            output_text=redacted_output,
+        )
+
+        return a_id
+
+    def query_audits(
+        self,
+        provider: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query audit records from the configured repository.
+        """
+
+        rows = self.repository.get_audits(
+            provider=provider,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+
+        results: List[Dict[str, Any]] = []
+
+        for row in rows:
+            item = dict(row)
+
+            try:
+                item["input_check_result"] = json.loads(
+                    item["input_check_result"]
+                )
+            except Exception:
+                pass
+
+            if item.get("output_check_result"):
+                try:
+                    item["output_check_result"] = json.loads(
+                        item["output_check_result"]
+                    )
+                except Exception:
+                    pass
+
+            item["called_provider"] = bool(
+                item["called_provider"]
+            )
+
+            results.append(item)
+
+        return results
+
+    def health_check(self) -> bool:
+        """
+        Check whether the backing repository/database is reachable.
+        """
+
+        health_check = getattr(
+            self.repository,
+            "health_check",
+            None,
+        )
+
+        if health_check is None:
+            return False
+
+        return bool(health_check())

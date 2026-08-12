@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Databases & local logs
+data/*.db
+data/*.db-journal
+data/*.sqlite
+logs/
+
+# pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Hugging Face / model caches
+.cache/
