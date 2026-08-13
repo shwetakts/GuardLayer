@@ -1,4 +1,3 @@
-# Core dependencies
 fastapi
 uvicorn
 pydantic
@@ -9,18 +8,5 @@ httpx
 sqlalchemy
 psycopg[binary]
 psycopg2-binary
-
-# ML - CPU only
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.13.0+cpu
-sentence-transformers
-
-# Testing
+openai
 pytest
-
-# Optional cloud providers
-# openai
-# anthropic
-
-# Optional HF models
-# transformers
