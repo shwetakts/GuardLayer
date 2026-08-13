@@ -1,402 +1,1935 @@
 # GuardLayer — Cross-Provider Guardrail Policy Engine
 
-GuardLayer enforces LLM governance policies defined once in YAML and applies them consistently across multiple LLM providers. Input and output content is checked for PII, toxicity, and banned topics before reaching the provider and again before reaching the user. Every request is audited with a sanitized, PII-redacted record. No raw PII is ever stored.
+GuardLayer is a provider-agnostic LLM governance and guardrail API that sits between an application and an LLM provider.
+
+It allows an organization to define governance policies once in YAML and enforce them consistently across LLM requests and responses.
+
+GuardLayer performs:
+
+- PII detection and redaction
+- Toxicity detection
+- Denied-topic detection
+- Input blocking before the LLM is called
+- Output blocking/redaction after the LLM responds
+- Policy inheritance and validation
+- Structured request tracing
+- PII-redacted audit logging
+- Provider abstraction
+- OpenRouter integration
+- Extensible provider adapters
+
+The application is currently deployed as a Docker container on an AWS EC2 instance and is accessible through a public HTTP API.
 
 ---
 
 ## Table of Contents
 
-1. [What GuardLayer Does](#1-what-guardlayer-does)
-2. [Architecture & Request Flow](#2-architecture--request-flow)
-3. [Project Structure](#3-project-structure)
-4. [Installation](#4-installation)
-5. [Configuration](#5-configuration)
-6. [Local & Provider Model Requirements](#6-local--provider-model-requirements)
-7. [Running the Application](#7-running-the-application)
-8. [Running the Demo](#8-running-the-demo)
-9. [What the Demo Demonstrates](#9-what-the-demo-demonstrates)
-10. [Audit Logging & Structured Request Context](#10-audit-logging--structured-request-context)
-11. [PII Detection & HF NER Fallback](#11-pii-detection--hf-ner-fallback)
-12. [Testing](#12-testing)
-13. [Current Limitations & Development Notes](#13-current-limitations--development-notes)
+1. [Overview](#1-overview)
+2. [What GuardLayer Does](#2-what-guardlayer-does)
+3. [Architecture](#3-architecture)
+4. [Request Flow](#4-request-flow)
+5. [Current Deployment](#5-current-deployment)
+6. [Using the Deployed API](#6-using-the-deployed-api)
+7. [API Endpoints](#7-api-endpoints)
+8. [Project Structure](#8-project-structure)
+9. [Installation](#9-installation)
+10. [Configuration](#10-configuration)
+11. [LLM Providers](#11-llm-providers)
+12. [OpenRouter Integration](#12-openrouter-integration)
+13. [Docker Deployment](#13-docker-deployment)
+14. [AWS Deployment](#14-aws-deployment)
+15. [Company Integration](#15-company-integration)
+16. [Policy Configuration](#16-policy-configuration)
+17. [PII Detection](#17-pii-detection)
+18. [Toxicity Detection](#18-toxicity-detection)
+19. [Topic Detection](#19-topic-detection)
+20. [Audit Logging](#20-audit-logging)
+21. [Structured Request Context](#21-structured-request-context)
+22. [Running Locally](#22-running-locally)
+23. [Running the Demo](#23-running-the-demo)
+24. [Testing](#24-testing)
+25. [Security Considerations](#25-security-considerations)
+26. [Current Limitations](#26-current-limitations)
+27. [Future Improvements](#27-future-improvements)
 
 ---
 
-## 1. What GuardLayer Does
+# 1. Overview
 
-An enterprise that uses multiple LLM providers faces a fragmented governance problem: each provider has its own (or no) native safety controls, requiring duplicated, provider-specific policy implementations.
+Modern applications often use multiple LLM providers. Each provider may have different APIs, safety mechanisms, models, and configuration.
 
-GuardLayer solves this with a single policy engine sitting in front of all providers:
+This creates a governance problem:
 
-- **Define once** — governance rules (PII redaction, toxicity thresholds, denied topics) are written in a single YAML policy file.
-- **Enforce everywhere** — the same `GuardEngine` runs those rules against every request and response, regardless of provider.
-- **Audit uniformly** — every interaction is written to a SQLite audit log with an identical schema across providers, with PII redacted before storage.
-- **Inherit safely** — child policies can extend a base policy but cannot weaken it (cannot lower toxicity thresholds, cannot remove denied topics, cannot demote block to allow).
-
----
-
-## 2. Architecture & Request Flow
-
+```text
+Application
+   │
+   ├── Provider A → custom safety logic
+   ├── Provider B → different safety logic
+   └── Provider C → different safety logic
 ```
+
+GuardLayer provides a centralized policy enforcement layer:
+
+```text
+Application
+      │
+      ▼
+  GuardLayer
+      │
+      ├── Policy enforcement
+      ├── PII detection
+      ├── Toxicity detection
+      ├── Topic detection
+      ├── Input blocking/redaction
+      ├── Output blocking/redaction
+      └── Audit logging
+      │
+      ▼
+  LLM Provider
+      │
+      ▼
+     LLM
+```
+
+The application calling GuardLayer does not need to implement the governance logic itself.
+
+---
+
+# 2. What GuardLayer Does
+
+GuardLayer follows a "define once, enforce everywhere" model.
+
+## Define once
+
+Governance policies are defined in YAML.
+
+Example policy concepts include:
+
+- PII handling
+- Toxicity thresholds
+- Denied topics
+- Block/redact/allow actions
+- Policy inheritance
+
+## Enforce everywhere
+
+The same guardrail engine is applied regardless of which provider is selected.
+
+For example:
+
+```text
 Client
   │
   ▼
-POST /chat  (FastAPI)
-  │  Sets request_id / session_id / agent_id in logging context (contextvars)
+POST /chat
   │
   ▼
-Policy Loader
-  │  Loads & merges YAML policy; hashes effective policy for versioning
+GuardEngine
+  │
+  ├── Check input
+  │
+  ├── Block or redact if required
   │
   ▼
-GuardEngine.check_input(text, policy)
-  ├── PIIDetector   → regex (email, phone, credit-card/Luhn) + optional HF NER (PERSON, ORG, LOC)
-  ├── ToxicityScorer→ optional HF text-classification model; falls back to TF-IDF + LogisticRegression
-  └── TopicDenier   → keyword matching + optional sentence-transformers cosine similarity
-  │
-  │  If BLOCK → write audit (called_provider=False) → return 200 blocked response
-  │  If REDACT → replace PII spans in message before forwarding
+ProviderRouter
   │
   ▼
-ProviderRouter → selects adapter by provider name
-  ├── MockOpenAIAdapter   (test/demo — deterministic responses)
-  ├── MockAnthropicAdapter(test/demo — deterministic responses)
-  ├── OllamaProvider      (real local inference via Ollama OpenAI-compatible endpoint)
-  └── [custom adapters]   (register at runtime via router.register())
+LLM Provider
   │
   ▼
-GuardEngine.check_output(response, policy)
-  ├── PIIDetector   → same pipeline as input
-  ├── ToxicityScorer
-  └── TopicDenier
+GuardEngine
   │
-  │  If BLOCK → "Response blocked by safety policy."
-  │  If REDACT → replace PII spans in response text
+  ├── Check output
+  │
+  ├── Block or redact if required
   │
   ▼
-AuditLogger.log(...)
-  │  PIIDetector.redact() run on input/output before INSERT
-  │  Writes to SQLiteAuditRepository via AuditRepository protocol
+Audit Logger
   │
   ▼
-ChatResponse → returned to client
-  (request_id, audit_id, provider, model, final_action, blocked_rules)
+Client
 ```
 
-All log lines emitted during a request carry `request_id`, `session_id`, and `agent_id` via Python `contextvars` — no manual threading is required.
+## Audit uniformly
+
+Every request generates an audit record.
+
+Sensitive information is redacted before being stored.
+
+Raw PII is not intentionally persisted in the audit database.
+
+## Inherit safely
+
+Child policies can extend a parent policy but cannot weaken mandatory governance controls.
+
+For example, a child policy cannot:
+
+- Lower a required toxicity threshold
+- Remove mandatory denied topics
+- Change a mandatory `block` action into `allow`
 
 ---
 
-## 3. Project Structure
+# 3. Architecture
 
-```
-C:\GuardLayer\
-│
-├── app\
-│   ├── config.py          # pydantic-settings; all env-var configuration
-│   ├── dependencies.py    # FastAPI Depends factories (engine, router, audit)
-│   └── main.py            # FastAPI app, /chat /health /policy /audit endpoints
-│
-├── core\
-│   ├── checks\
-│   │   ├── pii_detector.py     # Regex + optional HF NER (lazy-loaded)
-│   │   ├── topic_denier.py     # Keyword + optional sentence-transformers similarity
-│   │   └── toxicity_scorer.py  # Optional HF classifier; fallback to TF-IDF/LogReg
-│   ├── exceptions.py           # ProviderTimeoutError, ProviderUnavailableError
-│   ├── guard_engine.py         # check_input / check_output orchestration
-│   ├── logging_context.py      # contextvars, ContextFilter, JSONFormatter, setup_logging
-│   ├── models.py               # Pydantic models (Policy, PolicyRule, ChatRequest, …)
-│   └── policy_loader.py        # YAML load, extends/merge, inheritance safety checks
-│
-├── providers\
-│   ├── base.py                 # BaseProviderAdapter (async generate interface)
-│   ├── mock_openai.py          # Deterministic mock for tests and demo
-│   ├── mock_anthropic.py       # Deterministic mock for tests and demo
-│   ├── mock_third.py           # Extensibility demonstration adapter
-│   ├── ollama.py               # Real local Ollama provider (httpx, async)
-│   └── router.py               # ProviderRouter: name → adapter dispatch
-│
-├── storage\
-│   ├── base.py                 # AuditRepository Protocol (interface)
-│   ├── sqlite_repository.py    # SQLiteAuditRepository implementation
-│   └── audit_logger.py         # AuditLogger: PII-redacts then delegates to repository
-│
-├── policy\
-│   ├── base_policy.yaml        # Root governance policy (cannot be weakened by children)
-│   └── policy.yaml             # Active child policy (extends base_policy.yaml)
-│
-├── tests\                      # pytest test suite (16 files, phases 1–7 + integration)
-├── data\                       # SQLite audit DB written here at runtime
-├── demo.py                     # End-to-end demonstration script
-├── requirements.txt
-└── README.md
-```
-
----
-
-## 4. Installation
-
-Requires **Python 3.11+** and **Windows PowerShell** (paths use `\`).
-
-```powershell
-cd C:\GuardLayer
-
-# Create and activate virtual environment
-python -m venv .venv
-.venv\Scripts\activate
-
-# Install all dependencies
-pip install -r requirements.txt
-```
-
-`requirements.txt` installs:
-
-| Package | Purpose |
-|---|---|
-| `fastapi` + `uvicorn` | API server |
-| `pydantic` + `pydantic-settings` | Models and configuration |
-| `pyyaml` | Policy file parsing |
-| `scikit-learn` | TF-IDF / LogisticRegression fallback toxicity scorer |
-| `httpx` | Async HTTP client for Ollama provider |
-| `sentence-transformers` | Semantic topic similarity (lazy-loaded; optional) |
-| `pytest` + `anyio` | Test runner |
-
-> **Hugging Face models** (`transformers`, `torch`) are **not** in `requirements.txt`. Install them separately only if you intend to enable `USE_HF_TOXICITY=True` or `USE_HF_PII_NER=True` (see §6).
-
----
-
-## 5. Configuration
-
-All configuration is read from environment variables (or a `.env` file). Defaults are safe for local development without any API keys.
-
-| Variable | Default | Description |
-|---|---|---|
-| `GUARDLAYER_POLICY_PATH` | `C:\GuardLayer\policy\policy.yaml` | Active policy file |
-| `GUARDLAYER_DB_PATH` | `C:\GuardLayer\data\audit.db` | SQLite database path (legacy; also sets DATABASE_URL) |
-| `GUARDLAYER_DATABASE_URL` | `sqlite:///C:\GuardLayer\data\audit.db` | Full SQLite URL used by the audit repository |
-| `GUARDLAYER_LOG_LEVEL` | `INFO` | Root log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `GUARDLAYER_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `GUARDLAYER_OLLAMA_MODEL` | `llama2` | Ollama model name |
-| `GUARDLAYER_PROVIDER_TIMEOUT` | `60` | Provider HTTP timeout in seconds |
-| `GUARDLAYER_EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | sentence-transformers model for topic similarity |
-| `USE_HF_TOXICITY` | `False` | Enable real HF toxicity classifier (requires `transformers`) |
-| `GUARDLAYER_TOXICITY_MODEL_NAME` | `Hate-speech-CNERG/dehatebert-mono-english` | HF model for toxicity |
-| `USE_HF_PII_NER` | `False` | Enable real HF NER for PERSON/ORG/LOC detection (requires `transformers`) |
-| `GUARDLAYER_PII_NER_MODEL_NAME` | `dslim/distilbert-NER` | HF model for NER PII |
-
-**Both HF flags default to `False`.** No model is downloaded unless you explicitly set them to `True` and have `transformers` and `torch` installed.
-
----
-
-## 6. Local & Provider Model Requirements
-
-### Mock providers (default, no download)
-`mock_openai`, `mock_anthropic`, and `mock_third` return deterministic responses. They are the default providers used in tests and the demo. No API keys or network access required.
-
-### Ollama (real local inference, no API key)
-1. Install Ollama from [https://ollama.com](https://ollama.com).
-2. Pull a model: `ollama pull llama2` (or whichever model you set in `OLLAMA_MODEL`).
-3. Ensure the server is running: `ollama serve`.
-4. Set `provider: "ollama"` in your `/chat` request body.
-
-### Hugging Face toxicity model (`USE_HF_TOXICITY=True`)
-```powershell
-pip install transformers torch
-$env:USE_HF_TOXICITY = "True"
-```
-First call will download `Hate-speech-CNERG/dehatebert-mono-english` (~268 MB) to the local HF cache. Subsequent calls use the cached model. CPU inference only.
-
-### Hugging Face NER model (`USE_HF_PII_NER=True`)
-```powershell
-pip install transformers torch
-$env:USE_HF_PII_NER = "True"
-```
-First call will download `dslim/distilbert-NER` to the local HF cache. CPU inference only.
-
-### sentence-transformers (semantic topic detection)
-`sentence-transformers` is already in `requirements.txt`. The `all-MiniLM-L6-v2` model (~80 MB) is downloaded on first use when a policy rule sets `semantic_threshold`. It is **not** loaded on startup.
-
----
-
-## 7. Running the Application
-
-```powershell
-cd C:\GuardLayer
-.venv\Scripts\activate
-uvicorn app.main:app --reload
-```
-
-The API is available at `http://127.0.0.1:8000`.  
-Interactive Swagger docs: `http://127.0.0.1:8000/docs`
-
-### Example: clean request
-```powershell
-curl -X POST http://127.0.0.1:8000/chat `
-  -H "Content-Type: application/json" `
-  -d '{"provider":"openai","messages":[{"role":"user","content":"How does gravity work?"}]}'
-```
-
-### Example: PII in response (will be redacted)
-```powershell
-curl -X POST http://127.0.0.1:8000/chat `
-  -H "Content-Type: application/json" `
-  -d '{"provider":"openai","messages":[{"role":"user","content":"trigger pii"}]}'
-```
-
-### Example: query audit log
-```powershell
-curl http://127.0.0.1:8000/audit?provider=openai
+```text
+                         ┌──────────────────────┐
+                         │      Client App      │
+                         └──────────┬───────────┘
+                                    │
+                                    │ POST /chat
+                                    ▼
+                         ┌──────────────────────┐
+                         │      FastAPI         │
+                         │      /chat           │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │    Policy Loader     │
+                         │                      │
+                         │ YAML policy + hash   │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │     GuardEngine      │
+                         │                      │
+                         │ PII                  │
+                         │ Toxicity             │
+                         │ Topics               │
+                         └──────────┬───────────┘
+                                    │
+                         ┌──────────┴──────────┐
+                         │                     │
+                       BLOCK                 ALLOW/
+                         │                   REDACT
+                         ▼                     │
+                    Audit + Return             ▼
+                                      ┌──────────────────┐
+                                      │ Provider Router  │
+                                      └────────┬─────────┘
+                                               │
+                           ┌───────────────────┼──────────────────┐
+                           │                   │                  │
+                           ▼                   ▼                  ▼
+                     OpenRouter             Ollama          Mock Providers
+                           │
+                           ▼
+                         LLM
+                           │
+                           ▼
+                    Output Guardrails
+                           │
+                           ▼
+                     Audit Logger
+                           │
+                           ▼
+                         Client
 ```
 
 ---
 
-## 8. Running the Demo
+# 4. Request Flow
 
-```powershell
-cd C:\GuardLayer
-.venv\Scripts\activate
-python demo.py
-```
+A request to `/chat` follows these stages.
 
-The demo runs entirely in-process using FastAPI's `TestClient`. No server needs to be running. No model downloads are triggered — both `USE_HF_TOXICITY` and `USE_HF_PII_NER` are forced to `False` at the start of the script, and NER PII detection is demonstrated using an injected mock pipeline.
+## Step 1 — Client sends request
 
----
-
-## 9. What the Demo Demonstrates
-
-The demo walks through all eight success criteria and prints a pass/fail summary:
-
-| # | Criterion |
-|---|---|
-| SC-1 | PII (email, phone) in mock LLM output is redacted consistently across OpenAI and Anthropic providers |
-| SC-2 | Toxic input is blocked **before** the provider is called (`called_provider=False` in the audit) |
-| SC-3 | Audit records for OpenAI, Anthropic, and the custom third provider have an identical schema |
-| SC-4 | A third provider adapter registered at runtime is immediately covered by the same guardrail policy |
-| SC-5 | A request containing a denied topic (`credential theft`) is blocked on input |
-| SC-6 | A child policy attempting to weaken a parent toxicity threshold is rejected at load time with `ValueError` |
-| SC-7 | NER-based PII detection (injected mock pipeline) correctly detects `PERSON` entities and redacts them |
-| SC-8 | A caller-supplied `request_id` is echoed in the response and persisted in the audit record alongside `session_id` and `agent_id` |
-
----
-
-## 10. Audit Logging & Structured Request Context
-
-### Audit record fields
-
-Every request writes one row to `data/audit.db` (table: `audits`):
-
-| Field | Description |
-|---|---|
-| `audit_id` | UUID primary key |
-| `timestamp` | ISO-8601 UTC |
-| `provider` | LLM provider name (e.g. `openai`, `ollama`) |
-| `request_id` | Caller-supplied or auto-generated UUID |
-| `session_id` | Optional session context |
-| `agent_id` | Optional agent context |
-| `policy_version` | SHA-256 of the effective merged policy |
-| `input_check_result` | JSON: allowed, matched_rules, action, findings |
-| `output_check_result` | JSON: same structure; null if provider was not called |
-| `final_action` | `allow`, `redact`, or `block` |
-| `latency_ms` | Total wall time for the request |
-| `called_provider` | `1` if the provider was reached; `0` if blocked before the call |
-| `input_text` | PII-redacted copy of the last user message |
-| `output_text` | PII-redacted copy of the provider response |
-
-**PII governance:** `AuditLogger.log()` runs `PIIDetector.redact()` on both `input_text` and `output_text` before any SQL write. Raw PII is never stored in the database.
-
-### Structured JSON logging
-
-All application log lines are emitted as JSON. Each log record automatically includes the current request context:
+Example:
 
 ```json
 {
-  "timestamp": "2026-08-12T08:30:01.123Z",
-  "level": "INFO",
-  "logger": "app.main",
-  "message": "Policy loaded. Version hash: a3b4c5...",
-  "request_id": "c1d2e3f4-...",
-  "session_id": "sess-xyz",
-  "agent_id": "agent-v1"
+  "provider": "openrouter",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, can you help me?"
+    }
+  ]
 }
 ```
 
-Context variables are set at the start of each `/chat` request and reset in a `finally` block, so they never leak between concurrent requests.
+## Step 2 — Request context is created
 
----
+GuardLayer establishes:
 
-## 11. PII Detection & HF NER Fallback
+- `request_id`
+- `session_id`
+- `agent_id`
 
-PII detection runs in two stages:
+If a request ID is not supplied, GuardLayer generates one.
 
-**Stage 1 — Regex (always active):**
-- Email: RFC-5321 pattern
-- Phone: common US formats with negative lookaround to avoid numeric false positives
-- Credit card: digit-sequence pattern validated with the Luhn checksum algorithm
+## Step 3 — Policy is applied
 
-**Stage 2 — HF NER (opt-in, lazy-loaded):**
-- Detects `PERSON`, `ORG`, and `LOCATION` entities using a local `dslim/distilbert-NER` model
-- Only activated when `USE_HF_PII_NER=True`
-- Model is loaded on the **first request that reaches the NER stage**, not at startup
-- If the model fails to load or inference throws, the detector silently falls back to regex-only behaviour
-- A mock pipeline can be injected via `PIIDetector.set_pipeline(pipe)` for tests — this prevents any model download
+The active YAML policy is loaded and its effective version is represented by a SHA-256 hash.
 
-**Fallback states:**
+## Step 4 — Input guardrails run
 
-| `USE_HF_PII_NER` | `PIIDetector.pipeline` value | Behaviour |
-|---|---|---|
-| `False` (default) | `"FALLBACK"` | Regex only; no import of `transformers` |
-| `True` | real pipeline object | NER + regex |
-| `True`, model fails to load | `"FALLBACK"` | Regex only; warning logged |
-| any | injected mock | Mock NER + regex (used in tests) |
+GuardLayer checks the input for:
 
----
+- PII
+- Toxicity
+- Denied topics
 
-## 12. Testing
+Possible actions include:
 
-All tests are in `tests/`. Run from the project root with the virtual environment active.
-
-```powershell
-# Full test suite
-.venv\Scripts\python.exe -m pytest tests -v
-
-# Individual phase tests
-.venv\Scripts\python.exe -m pytest tests/test_phase1.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase2.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase3.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase4.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase5.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase6.py -v
-.venv\Scripts\python.exe -m pytest tests/test_phase7.py -v
-
-# Integration tests
-.venv\Scripts\python.exe -m pytest tests/test_integration.py -v
-
-# Specific component tests
-.venv\Scripts\python.exe -m pytest tests/test_guard_engine.py tests/test_pii.py tests/test_policy.py -v
+```text
+ALLOW
+REDACT
+BLOCK
 ```
 
-**No test downloads any model.** Phase 4 and Phase 5 tests inject mock pipelines via `set_pipeline()`. Phase 3 tests that exercise semantic similarity use the `sentence-transformers` package but only if the model is already cached.
+If the request is blocked:
+
+```text
+Client
+  │
+  ▼
+GuardLayer
+  │
+  ├── Input violates policy
+  │
+  ├── Provider is NOT called
+  │
+  └── Audit record created
+```
+
+## Step 5 — Provider is called
+
+If allowed, or after required redaction, GuardLayer sends the request to the selected provider.
+
+The current deployed real provider is OpenRouter.
+
+### LLM Provider API Keys
+
+GuardLayer itself does not require OpenAI or Anthropic API keys to run.
+
+The application is designed around a provider-adapter architecture, so provider credentials are only required when using a real external LLM provider that requires authentication.
+
+For example:
+
+- `provider: "openrouter"` requires a valid `OPENROUTER_API_KEY`.
+- A direct OpenAI adapter would require an `OPENAI_API_KEY`.
+- A direct Anthropic adapter would require an `ANTHROPIC_API_KEY`.
+- `provider: "ollama"` does not require an API key because Ollama runs locally.
+- The mock providers (`mock_openai`, `mock_anthropic`, `mock_third`) do not require any API keys.
+
+**Important:** The names `mock_openai` and `mock_anthropic` do not mean that GuardLayer has access to OpenAI or Anthropic accounts. They are deterministic test adapters used to demonstrate that the same guardrail policy can be applied independently of the underlying LLM provider.
+
+When deploying GuardLayer with a real provider, add the appropriate credentials to `.env` or the deployment environment. Never commit API keys to source control.
+
+## Step 6 — Output guardrails run
+
+The LLM response is checked again for:
+
+- PII
+- Toxicity
+- Denied topics
+
+## Step 7 — Audit record is created
+
+The interaction is recorded after PII redaction.
+
+## Step 8 — Response is returned
+
+The client receives:
+
+- LLM response
+- provider
+- model
+- guardrail status
+- final action
+- policy version
+- audit ID
+- request ID
+- blocked rules, if applicable
 
 ---
 
-## 13. Current Limitations & Development Notes
+# 5. Current Deployment
 
-### Provider adapters
-`mock_openai`, `mock_anthropic`, and `mock_third` are **deterministic test doubles**, not SDK wrappers. They return hardcoded responses designed to exercise guardrail paths (clean text, PII-containing text, etc.). To use real providers, implement `BaseProviderAdapter.generate()` with the provider's SDK and register the adapter in `app/dependencies.py`.
+GuardLayer is currently deployed on AWS using Docker and Amazon EC2.
 
-The `OllamaProvider` (`providers/ollama.py`) is a **real implementation** using `httpx.AsyncClient` against Ollama's OpenAI-compatible endpoint. It requires a running Ollama server.
+## Deployment architecture
 
-### Toxicity scorer
-When `USE_HF_TOXICITY=False` (the default), toxicity scoring uses a TF-IDF + LogisticRegression classifier trained on a small, hardcoded synthetic dataset. This classifier is deterministic and requires no network access, but its coverage is limited. Enable the HF model for production-grade detection.
+```text
+Internet
+   │
+   ▼
+Public IPv4
+   │
+   ▼
+AWS EC2
+   │
+   ▼
+Docker
+   │
+   ▼
+guardlayer:latest
+   │
+   ▼
+Uvicorn
+   │
+   ▼
+FastAPI
+   │
+   ├── GuardEngine
+   ├── Policy Engine
+   ├── Audit Logger
+   │
+   ▼
+OpenRouter
+   │
+   ▼
+LLM
+```
 
-### SQLite
-The audit store uses SQLite via direct `sqlite3` calls. This is appropriate for single-process development. For production, replace `SQLiteAuditRepository` with a PostgreSQL or other implementation of the `AuditRepository` protocol.
+## Public API
 
-### Semantic topic detection
-Semantic similarity checking (via `sentence-transformers`) is only triggered if a policy rule sets `semantic_threshold`. It is not enabled in the default `policy.yaml`. Keyword matching is always active.
+The current deployed API is available at:
 
-### Streaming
-The current implementation buffers the full provider response before running output guardrails. Streaming is not supported.
+```text
+http://3.110.47.189:8000
+```
 
-### Policy hot-reload
-The policy is loaded once at startup (`@app.on_event("startup")`). Changes to the YAML file require a server restart.
+Interactive API documentation:
+
+```text
+http://3.110.47.189:8000/docs
+```
+
+Health endpoint:
+
+```text
+http://3.110.47.189:8000/health
+```
+
+OpenAPI specification:
+
+```text
+http://3.110.47.189:8000/openapi.json
+```
+
+> The public IP and port are deployment-specific. If the EC2 public IP changes, these URLs must be updated. Using an Elastic IP or DNS name is recommended for a more stable production deployment.
+
+---
+
+# 6. Using the Deployed API
+
+GuardLayer is an API service.
+
+A frontend is **not required** to use the application.
+
+Any application capable of making HTTP requests can integrate with GuardLayer.
+
+The simplest interaction is:
+
+```text
+Company Application
+        │
+        │ HTTP POST
+        ▼
+GuardLayer /chat
+        │
+        ▼
+LLM Provider
+        │
+        ▼
+GuardLayer
+        │
+        ▼
+Company Application
+```
+
+---
+
+## 6.1 Health Check
+
+Run:
+
+```bash
+curl http://3.110.47.189:8000/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "database": "ok",
+  "policy_version": "ea602985d98e793282d6b11f29e8e1c1a7fcb6bf49b78efe9ab34501500e4a46"
+}
+```
+
+The exact `policy_version` changes whenever the effective policy changes.
+
+---
+
+# 6.2 Send a Chat Request
+
+Example:
+
+```bash
+curl -X POST http://3.110.47.189:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openrouter",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, can you help me?"
+      }
+    ]
+  }'
+```
+
+Example response:
+
+```json
+{
+  "response": "Of course! What do you need help with?",
+  "provider": "openrouter",
+  "model": "openai/gpt-3.5-turbo",
+  "guardrail_applied": true,
+  "final_action": "allow",
+  "policy_version": "ea602985d98e793282d6b11f29e8e1c1a7fcb6bf49b78efe9ab34501500e4a46",
+  "audit_id": "061bcd43-8d1f-42a7-8b9d-bfe5c4c86ef4",
+  "request_id": "249df803-2038-485f-84f1-4f99f63c8b71",
+  "blocked_rules": null
+}
+```
+
+The model is configurable through `OPENROUTER_MODEL`.
+
+---
+
+# 6.3 Supplying Request Context
+
+Applications can provide their own request, session, and agent IDs.
+
+Example:
+
+```bash
+curl -X POST http://3.110.47.189:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openrouter",
+    "agent_id": "customer-support-agent",
+    "session_id": "session-001",
+    "request_id": "request-001",
+    "messages": [
+      {
+        "role": "user",
+        "content": "How can I reset my password?"
+      }
+    ]
+  }'
+```
+
+These identifiers are returned in the response and persisted in the audit record.
+
+---
+
+# 6.4 Interactive Swagger Documentation
+
+GuardLayer exposes automatically generated OpenAPI documentation.
+
+Open:
+
+```text
+http://3.110.47.189:8000/docs
+```
+
+Swagger provides an interactive interface for testing endpoints such as:
+
+```text
+POST /chat
+GET  /health
+GET  /policy
+POST /policy/validate
+GET  /audit
+```
+
+No custom frontend is required to test the API.
+
+---
+
+# 7. API Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/chat` | POST | Send an LLM request through GuardLayer |
+| `/health` | GET | Check API, database, and policy health |
+| `/docs` | GET | Interactive Swagger/OpenAPI documentation |
+| `/openapi.json` | GET | OpenAPI specification |
+| `/policy` | GET | Retrieve the active policy |
+| `/policy/validate` | POST | Validate a policy |
+| `/audit` | GET | Retrieve audit records |
+
+---
+
+## `/chat`
+
+Main LLM gateway endpoint.
+
+Request:
+
+```json
+{
+  "provider": "openrouter",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello"
+    }
+  ],
+  "agent_id": "optional-agent-id",
+  "session_id": "optional-session-id",
+  "request_id": "optional-request-id"
+}
+```
+
+Response:
+
+```json
+{
+  "response": "Hello!",
+  "provider": "openrouter",
+  "model": "openai/gpt-3.5-turbo",
+  "guardrail_applied": true,
+  "final_action": "allow",
+  "policy_version": "...",
+  "audit_id": "...",
+  "request_id": "...",
+  "blocked_rules": null
+}
+```
+
+---
+
+## `/health`
+
+Example:
+
+```bash
+curl http://3.110.47.189:8000/health
+```
+
+Returns:
+
+```json
+{
+  "status": "ok",
+  "database": "ok",
+  "policy_version": "..."
+}
+```
+
+---
+
+## `/policy`
+
+Returns the active policy.
+
+```bash
+curl http://3.110.47.189:8000/policy
+```
+
+---
+
+## `/policy/validate`
+
+Validates a policy without necessarily replacing the active policy.
+
+Example:
+
+```bash
+curl -X POST http://3.110.47.189:8000/policy/validate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rules": []
+  }'
+```
+
+---
+
+## `/audit`
+
+Returns audit records.
+
+Example:
+
+```bash
+curl "http://3.110.47.189:8000/audit"
+```
+
+Filtering is supported by:
+
+- provider
+- agent ID
+- session ID
+
+Example:
+
+```bash
+curl "http://3.110.47.189:8000/audit?provider=openrouter"
+```
+
+---
+
+# 8. Project Structure
+
+```text
+GuardLayer/
+│
+├── app/
+│   ├── config.py
+│   ├── dependencies.py
+│   └── main.py
+│
+├── core/
+│   ├── checks/
+│   │   ├── pii_detector.py
+│   │   ├── topic_denier.py
+│   │   └── toxicity_scorer.py
+│   │
+│   ├── exceptions.py
+│   ├── guard_engine.py
+│   ├── logging_context.py
+│   ├── models.py
+│   └── policy_loader.py
+│
+├── providers/
+│   ├── base.py
+│   ├── mock_openai.py
+│   ├── mock_anthropic.py
+│   ├── mock_third.py
+│   ├── openrouter.py
+│   ├── ollama.py
+│   └── router.py
+│
+├── storage/
+│   ├── base.py
+│   ├── sqlite_repository.py
+│   └── audit_logger.py
+│
+├── policy/
+│   ├── base_policy.yaml
+│   └── policy.yaml
+│
+├── tests/
+│
+├── data/
+│   └── audit.db
+│
+├── demo.py
+├── Dockerfile
+├── requirements.txt
+├── .env
+└── README.md
+```
+
+> The exact file list may vary depending on enabled providers and implementation changes.
+
+---
+
+# 9. Installation
+
+## Requirements
+
+For local development:
+
+- Python 3.11+
+- pip
+- Git
+- Optional: Docker
+
+For the AWS deployment:
+
+- AWS EC2
+- Docker
+- Internet connectivity from the EC2 instance
+- OpenRouter API credentials
+
+---
+
+## Python Installation
+
+Create a virtual environment:
+
+```powershell
+python -m venv .venv
+```
+
+Activate it on Windows:
+
+```powershell
+.venv\Scripts\activate
+```
+
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Current core dependencies:
+
+| Package | Purpose |
+|---|---|
+| `fastapi` | Web API framework |
+| `uvicorn` | ASGI application server |
+| `pydantic` | Request/response models |
+| `pydantic-settings` | Environment configuration |
+| `pyyaml` | YAML policy parsing |
+| `scikit-learn` | Toxicity fallback classifier |
+| `httpx` | Async HTTP requests |
+| `sqlalchemy` | Database abstraction/support |
+| `psycopg[binary]` | PostgreSQL driver |
+| `psycopg2-binary` | PostgreSQL compatibility |
+| `openai` | OpenAI-compatible LLM API client, including OpenRouter |
+| `pytest` | Testing |
+
+---
+
+# 10. Configuration
+
+GuardLayer reads configuration from environment variables and/or a `.env` file.
+
+## Example `.env`
+
+```text
+OPENROUTER_API_KEY=your-openrouter-api-key
+OPENROUTER_MODEL=openai/gpt-3.5-turbo
+
+GUARDLAYER_LOG_LEVEL=INFO
+GUARDLAYER_PROVIDER_TIMEOUT=60
+```
+
+Never commit `.env` to Git.
+
+Add it to `.gitignore`:
+
+```text
+.env
+```
+
+---
+
+## Configuration Variables
+
+| Variable | Description |
+|---|---|
+| `OPENROUTER_API_KEY` | API key used to authenticate with OpenRouter |
+| `OPENROUTER_MODEL` | Model used by the OpenRouter provider |
+| `GUARDLAYER_POLICY_PATH` | Path to active YAML policy |
+| `GUARDLAYER_DB_PATH` | Path to audit database |
+| `GUARDLAYER_DATABASE_URL` | Database connection URL |
+| `GUARDLAYER_LOG_LEVEL` | Logging level |
+| `GUARDLAYER_PROVIDER_TIMEOUT` | Provider timeout in seconds |
+| `GUARDLAYER_OLLAMA_BASE_URL` | Ollama endpoint |
+| `GUARDLAYER_OLLAMA_MODEL` | Ollama model |
+| `GUARDLAYER_EMBEDDING_MODEL_NAME` | Optional embedding model |
+| `USE_HF_TOXICITY` | Enables Hugging Face toxicity model |
+| `GUARDLAYER_TOXICITY_MODEL_NAME` | Hugging Face toxicity model |
+| `USE_HF_PII_NER` | Enables Hugging Face NER |
+| `GUARDLAYER_PII_NER_MODEL_NAME` | Hugging Face NER model |
+
+The exact defaults are defined by `app/config.py`.
+
+---
+
+# 11. LLM Providers
+
+GuardLayer uses a provider abstraction so that guardrail logic is independent of the underlying LLM provider.
+
+The router selects an adapter based on the `provider` field.
+
+Currently supported provider types include:
+
+```text
+openrouter
+ollama
+mock_openai
+mock_anthropic
+mock_third
+```
+
+---
+
+## OpenRouter
+
+OpenRouter is the current real provider used by the deployed application.
+
+GuardLayer communicates with OpenRouter using the OpenAI-compatible API interface and the `openai` Python package.
+
+This means:
+
+```text
+GuardLayer
+    │
+    │ OpenAI-compatible API
+    ▼
+OpenRouter
+    │
+    ▼
+Selected LLM
+```
+
+The client application does not need to know the OpenRouter API key.
+
+The key remains on the GuardLayer server.
+
+---
+
+## Ollama
+
+Ollama can be used for local inference.
+
+Example configuration:
+
+```text
+GUARDLAYER_OLLAMA_BASE_URL=http://localhost:11434
+GUARDLAYER_OLLAMA_MODEL=llama2
+```
+
+Ollama is optional and is not required for the current AWS OpenRouter deployment.
+
+---
+
+## Mock Providers
+
+Mock providers are deterministic providers used for:
+
+- Tests
+- Demonstrations
+- Guardrail validation
+- Provider abstraction testing
+
+They do not require an external LLM API.
+
+---
+
+# 12. OpenRouter Integration
+
+OpenRouter is currently the primary real LLM integration for the deployed GuardLayer instance.
+
+## Required configuration
+
+```text
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openai/gpt-3.5-turbo
+```
+
+The model can be changed without modifying the GuardLayer request interface.
+
+For example, the client continues to send:
+
+```json
+{
+  "provider": "openrouter",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello"
+    }
+  ]
+}
+```
+
+The selected model is controlled server-side through configuration.
+
+---
+
+## Why is the `openai` package required?
+
+OpenRouter exposes an OpenAI-compatible API.
+
+Therefore GuardLayer uses the `openai` Python SDK as the client library.
+
+This does **not** mean the request is necessarily sent to the OpenAI API.
+
+For the deployed configuration:
+
+```text
+GuardLayer
+    │
+    │ openai Python SDK
+    ▼
+OpenRouter API
+    │
+    ▼
+Configured OpenRouter model
+```
+
+---
+
+# 13. Docker Deployment
+
+GuardLayer is packaged as a Docker image.
+
+## Build
+
+From the project root:
+
+```bash
+docker build -t guardlayer:latest .
+```
+
+Check the image:
+
+```bash
+docker images | grep guardlayer
+```
+
+---
+
+## Run
+
+The application runs Uvicorn inside the container on port `8080`.
+
+Expose it as port `8000` on the host:
+
+```bash
+docker run -d \
+  --name guardlayer \
+  -p 8000:8080 \
+  --env-file .env \
+  guardlayer:latest
+```
+
+Check:
+
+```bash
+docker ps
+```
+
+Expected mapping:
+
+```text
+0.0.0.0:8000->8080/tcp
+```
+
+---
+
+## Verify the container
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected:
+
+```json
+{
+  "status": "ok",
+  "database": "ok",
+  "policy_version": "..."
+}
+```
+
+Check logs:
+
+```bash
+docker logs guardlayer
+```
+
+---
+
+# 14. AWS Deployment
+
+The current GuardLayer deployment uses Amazon EC2 as the compute environment.
+
+## Current AWS architecture
+
+```text
+                    Internet
+                       │
+                       ▼
+              Public IPv4 Address
+                3.110.47.189
+                       │
+                       ▼
+              ┌─────────────────┐
+              │    AWS EC2      │
+              │                 │
+              │ Ubuntu Linux    │
+              │                 │
+              │ Docker         │
+              │   │             │
+              │   ▼             │
+              │ GuardLayer      │
+              │ FastAPI         │
+              │ Uvicorn         │
+              └────────┬────────┘
+                       │
+                       │ HTTPS/API request
+                       ▼
+                  OpenRouter
+                       │
+                       ▼
+                      LLM
+```
+
+---
+
+## AWS services currently involved
+
+### Amazon EC2
+
+EC2 provides the virtual server running GuardLayer.
+
+The application is running inside a Docker container on the EC2 instance.
+
+### Elastic IP / Public IPv4
+
+The deployment uses a public IPv4 address for external access.
+
+Current endpoint:
+
+```text
+3.110.47.189
+```
+
+A stable Elastic IP or DNS name should be used for a production deployment.
+
+### EC2 Security Group
+
+The EC2 security group controls inbound traffic.
+
+Port `8000` must be reachable for the current HTTP API deployment.
+
+Recommended production configuration is to avoid exposing the application directly to the public internet and instead place it behind a reverse proxy/load balancer with HTTPS.
+
+---
+
+## AWS services not required by the current deployment
+
+The current GuardLayer deployment does not require:
+
+- AWS Lambda
+- Amazon ECS
+- Amazon EKS
+- Amazon RDS
+- API Gateway
+- CloudFront
+- Route 53
+
+These can be introduced later depending on production requirements.
+
+If an AWS load balancer is configured separately, it should only be described as part of the GuardLayer architecture if it is actually routing traffic to the GuardLayer EC2 instance.
+
+---
+
+# 15. Company Integration
+
+GuardLayer is designed to be used as a centralized LLM gateway.
+
+A company can integrate it without installing a frontend.
+
+Instead of:
+
+```text
+Company Application
+        │
+        ▼
+LLM Provider
+```
+
+the application can use:
+
+```text
+Company Application
+        │
+        ▼
+GuardLayer
+        │
+        ├── Input guardrails
+        ├── Policy enforcement
+        ├── PII detection
+        ├── Toxicity detection
+        ├── Topic detection
+        │
+        ▼
+LLM Provider
+        │
+        ▼
+GuardLayer
+        │
+        ├── Output guardrails
+        ├── PII redaction
+        └── Audit logging
+        │
+        ▼
+Company Application
+```
+
+The company application only needs to call the GuardLayer API.
+
+---
+
+## Example company integration
+
+The company sends:
+
+```http
+POST /chat
+Content-Type: application/json
+```
+
+with:
+
+```json
+{
+  "provider": "openrouter",
+  "agent_id": "support-agent",
+  "session_id": "session-123",
+  "messages": [
+    {
+      "role": "user",
+      "content": "How can I reset my password?"
+    }
+  ]
+}
+```
+
+GuardLayer then:
+
+1. Checks the input against policy.
+2. Blocks or redacts unsafe content if required.
+3. Calls the configured LLM provider.
+4. Checks the LLM response.
+5. Redacts unsafe output if required.
+6. Creates an audit record.
+7. Returns the final response.
+
+The company does **not** need to expose its LLM provider credentials to its frontend or end users.
+
+---
+
+# 16. Policy Configuration
+
+Policies are defined using YAML.
+
+The project contains:
+
+```text
+policy/
+├── base_policy.yaml
+└── policy.yaml
+```
+
+`base_policy.yaml` defines mandatory governance controls.
+
+`policy.yaml` can extend the base policy.
+
+The policy loader:
+
+1. Loads the YAML policy.
+2. Resolves inheritance.
+3. Validates policy safety.
+4. Produces the effective policy.
+5. Generates a SHA-256 policy version hash.
+
+The policy version is returned by:
+
+```text
+GET /health
+```
+
+and included in `/chat` responses and audit records.
+
+---
+
+## Policy inheritance
+
+A child policy cannot weaken mandatory parent controls.
+
+Examples of prohibited weakening:
+
+```text
+Parent toxicity threshold: 0.70
+Child toxicity threshold: 0.90
+```
+
+or:
+
+```text
+Parent denied topic: credential theft
+Child: removes credential theft
+```
+
+or:
+
+```text
+Parent action: block
+Child action: allow
+```
+
+These changes are rejected by the policy loader.
+
+---
+
+# 17. PII Detection
+
+GuardLayer detects PII before sending content to an LLM and again when inspecting the LLM response.
+
+## Regex-based detection
+
+The baseline detector supports:
+
+- Email addresses
+- Phone numbers
+- Credit-card-like number sequences
+- Luhn validation for credit cards
+
+Example:
+
+```text
+My email is alice@example.com
+```
+
+can be transformed before storage or forwarding according to policy.
+
+---
+
+## Hugging Face NER
+
+Optional NER-based PII detection can detect entities such as:
+
+- PERSON
+- ORGANIZATION
+- LOCATION
+
+Enable with:
+
+```text
+USE_HF_PII_NER=True
+```
+
+The NER functionality is optional and should only be enabled when the required ML dependencies are installed.
+
+---
+
+# 18. Toxicity Detection
+
+GuardLayer supports toxicity checking.
+
+When the Hugging Face toxicity model is disabled, GuardLayer can use a lightweight TF-IDF + LogisticRegression fallback.
+
+This fallback:
+
+- Requires no model download
+- Works locally
+- Is deterministic
+- Is suitable for demonstration/testing
+- Has limited coverage compared with a production-grade classifier
+
+The optional Hugging Face classifier can be enabled through configuration.
+
+```text
+USE_HF_TOXICITY=True
+```
+
+---
+
+# 19. Topic Detection
+
+GuardLayer supports denied-topic detection.
+
+The basic mechanism uses keyword matching.
+
+For policies configured to use semantic similarity, an embedding model can be used.
+
+Topic rules can therefore be used to prevent requests involving prohibited subjects from reaching the provider.
+
+Example:
+
+```text
+User
+  │
+  ▼
+"How can I steal someone's credentials?"
+  │
+  ▼
+TopicDenier
+  │
+  ▼
+BLOCK
+  │
+  ├── Provider not called
+  └── Audit record created
+```
+
+---
+
+# 20. Audit Logging
+
+Every request generates an audit record.
+
+The audit system uses an abstraction:
+
+```text
+AuditRepository
+```
+
+with the current implementation backed by SQLite.
+
+This allows the storage implementation to be replaced in the future without changing the guardrail engine.
+
+---
+
+## Audit fields
+
+Typical audit fields include:
+
+| Field | Description |
+|---|---|
+| `audit_id` | UUID identifying the audit event |
+| `timestamp` | UTC timestamp |
+| `provider` | Provider used |
+| `request_id` | Request identifier |
+| `session_id` | Session identifier |
+| `agent_id` | Agent identifier |
+| `policy_version` | Effective policy SHA-256 hash |
+| `input_check_result` | Input guardrail result |
+| `output_check_result` | Output guardrail result |
+| `final_action` | `allow`, `redact`, or `block` |
+| `latency_ms` | Total request latency |
+| `called_provider` | Whether provider was reached |
+| `input_text` | PII-redacted input |
+| `output_text` | PII-redacted output |
+
+---
+
+## PII-safe audit storage
+
+Before writing to the database:
+
+```text
+Input
+  │
+  ▼
+PII Detector
+  │
+  ▼
+Redacted Input
+  │
+  ▼
+Audit Database
+```
+
+The same process is applied to provider output.
+
+The intention is that raw PII is not persisted in audit records.
+
+---
+
+# 21. Structured Request Context
+
+GuardLayer uses Python `contextvars` to maintain request-specific context.
+
+The following identifiers are tracked:
+
+```text
+request_id
+session_id
+agent_id
+```
+
+These values are automatically included in structured application logs.
+
+Example:
+
+```json
+{
+  "timestamp": "2026-08-13T07:54:50.874353Z",
+  "level": "INFO",
+  "logger": "app.main",
+  "message": "Policy loaded.",
+  "request_id": "N/A",
+  "session_id": "N/A",
+  "agent_id": "N/A"
+}
+```
+
+During an actual request, the identifiers are populated.
+
+This provides traceability across:
+
+```text
+Client request
+      │
+      ▼
+GuardLayer
+      │
+      ├── Guardrail checks
+      ├── Provider call
+      ├── Logging
+      └── Audit
+```
+
+---
+
+# 22. Running Locally
+
+## Create virtual environment
+
+Windows:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+Linux/macOS:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+---
+
+## Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Configure environment
+
+Create `.env`:
+
+```text
+OPENROUTER_API_KEY=your-key
+OPENROUTER_MODEL=openai/gpt-3.5-turbo
+```
+
+Do not commit this file.
+
+---
+
+## Start FastAPI
+
+```bash
+uvicorn app.main:app --reload
+```
+
+The application normally runs on:
+
+```text
+http://127.0.0.1:8000
+```
+
+Swagger:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+Health:
+
+```text
+http://127.0.0.1:8000/health
+```
+
+---
+
+## Local `/chat` request
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openrouter",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, can you help me?"
+      }
+    ]
+  }'
+```
+
+---
+
+# 23. Running the Demo
+
+The project contains:
+
+```text
+demo.py
+```
+
+Run:
+
+```bash
+python demo.py
+```
+
+The demo is designed to demonstrate the guardrail engine and provider abstraction without requiring a production LLM call.
+
+The demo covers:
+
+- PII redaction
+- Toxic input blocking
+- Audit logging
+- Provider abstraction
+- Third-provider extensibility
+- Denied-topic blocking
+- Policy inheritance validation
+- NER-based PII detection
+- Request/session/agent context
+
+---
+
+# 24. Testing
+
+Run the full test suite:
+
+```bash
+python -m pytest tests -v
+```
+
+Specific test files can be executed with:
+
+```bash
+python -m pytest tests/test_phase1.py -v
+python -m pytest tests/test_phase2.py -v
+python -m pytest tests/test_phase3.py -v
+python -m pytest tests/test_phase4.py -v
+python -m pytest tests/test_phase5.py -v
+python -m pytest tests/test_phase6.py -v
+python -m pytest tests/test_phase7.py -v
+```
+
+Integration tests:
+
+```bash
+python -m pytest tests/test_integration.py -v
+```
+
+Component tests:
+
+```bash
+python -m pytest \
+  tests/test_guard_engine.py \
+  tests/test_pii.py \
+  tests/test_policy.py \
+  -v
+```
+
+The test suite is designed to avoid unnecessary external model downloads.
+
+---
+
+# 25. Security Considerations
+
+## API keys
+
+LLM provider credentials must remain server-side.
+
+Do not place:
+
+```text
+OPENROUTER_API_KEY
+```
+
+in:
+
+- Frontend JavaScript
+- Browser requests
+- Git repositories
+- Public README files
+- Docker images
+
+The client should call:
+
+```text
+Client → GuardLayer
+```
+
+rather than:
+
+```text
+Client → OpenRouter
+```
+
+with the provider key exposed to the client.
+
+---
+
+## `.env`
+
+Never commit:
+
+```text
+.env
+```
+
+to source control.
+
+Recommended `.gitignore`:
+
+```text
+.env
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+```
+
+---
+
+## Public API
+
+The current deployment uses plain HTTP:
+
+```text
+http://3.110.47.189:8000
+```
+
+This is suitable for development/demo access but is **not the recommended production configuration**.
+
+For production, GuardLayer should be placed behind:
+
+```text
+Internet
+    │
+    ▼
+HTTPS / TLS
+    │
+    ▼
+Load Balancer / Reverse Proxy
+    │
+    ▼
+GuardLayer
+```
+
+The production deployment should also consider:
+
+- HTTPS/TLS
+- Authentication
+- Authorization
+- Rate limiting
+- Request size limits
+- Network restrictions
+- Secret management
+- Centralized logging
+- Monitoring
+- Database backups
+- High availability
+
+---
+
+# 26. Current Limitations
+
+## No custom frontend
+
+GuardLayer currently exposes an API and Swagger UI rather than a custom web frontend.
+
+This is intentional because the core product is the LLM governance API.
+
+A frontend can be added later for:
+
+- Chat
+- Policy management
+- Audit visualization
+- Monitoring
+- Guardrail statistics
+
+---
+
+## HTTP rather than HTTPS
+
+The current public demo endpoint uses HTTP.
+
+Production deployments should use HTTPS.
+
+---
+
+## Authentication
+
+The current API does not provide a full enterprise authentication/authorization layer.
+
+Authentication should be added before exposing the service to untrusted users.
+
+---
+
+## SQLite
+
+The current deployment uses SQLite for audit persistence.
+
+SQLite is appropriate for a small/single-instance deployment but is not ideal for a high-scale multi-instance production architecture.
+
+A future deployment can use:
+
+```text
+GuardLayer
+    │
+    ▼
+PostgreSQL
+```
+
+for centralized audit storage.
+
+Amazon RDS PostgreSQL is one possible production option.
+
+---
+
+## Streaming
+
+The current implementation buffers the complete provider response before output guardrails are applied.
+
+Streaming responses are not currently supported.
+
+---
+
+## Policy hot reload
+
+The policy is loaded during application startup.
+
+Changing the YAML file requires restarting the application unless a hot-reload mechanism is added.
+
+---
+
+## Toxicity fallback model
+
+The lightweight TF-IDF + LogisticRegression toxicity fallback is useful for demonstration and development but should not be considered equivalent to a production-grade safety classifier.
+
+---
+
+# 27. Future Improvements
+
+Potential production enhancements include:
+
+### Security
+
+- HTTPS/TLS
+- API authentication
+- OAuth/JWT
+- Role-based access control
+- API key management
+- AWS Secrets Manager
+
+### AWS infrastructure
+
+```text
+Route 53
+    │
+    ▼
+Application Load Balancer
+    │
+    ▼
+GuardLayer
+    │
+    ▼
+EC2 / ECS
+```
+
+### Database
+
+Replace SQLite with PostgreSQL/RDS for:
+
+- Multi-instance deployments
+- Concurrent access
+- Backup
+- High availability
+- Centralized audit records
+
+### Observability
+
+Add:
+
+- CloudWatch metrics
+- CloudWatch logs
+- Request latency dashboards
+- Guardrail violation metrics
+- Provider failure metrics
+- Alerting
+
+### Frontend
+
+A lightweight administrative frontend could provide:
+
+```text
+┌───────────────────────────────────┐
+│          GuardLayer UI            │
+├───────────────────────────────────┤
+│                                   │
+│  Health       ● Healthy           │
+│                                   │
+│  Requests     12,481              │
+│  Blocked      1,284               │
+│  Redacted     2,431               │
+│                                   │
+│  Policy Version                   │
+│  ea602985...                      │
+│                                   │
+│  Recent Audit Events              │
+│  ─────────────────────────────    │
+│  Request       Action     Provider│
+│  req-001       allow      OpenRouter
+│  req-002       block      OpenRouter
+│  req-003       redact     OpenRouter
+│                                   │
+└───────────────────────────────────┘
+```
+
+This would provide operational visibility without changing the underlying GuardLayer API.
+
+---
+
+# Summary
+
+GuardLayer provides a centralized policy enforcement layer for LLM applications.
+
+The current deployment demonstrates the complete flow:
+
+```text
+                 Company Application
+                         │
+                         ▼
+                ┌─────────────────┐
+                │    GuardLayer   │
+                │                 │
+                │ Policy Engine   │
+                │ PII Detection   │
+                │ Toxicity        │
+                │ Topic Rules     │
+                │ Audit Logging   │
+                └────────┬────────┘
+                         │
+                         ▼
+                    OpenRouter
+                         │
+                         ▼
+                        LLM
+                         │
+                         ▼
+                Output Guardrails
+                         │
+                         ▼
+                    Audit Log
+                         │
+                         ▼
+                Company Application
+```
+
+The current deployed API can be tested through:
+
+```text
+http://3.110.47.189:8000/docs
+```
+
+The core integration point is:
+
+```text
+POST /chat
+```
+
+A client only needs to send a standard JSON request to GuardLayer. GuardLayer handles policy enforcement, provider communication, output validation, and audit logging behind the API boundary.
